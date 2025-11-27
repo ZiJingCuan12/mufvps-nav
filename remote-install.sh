@@ -453,6 +453,8 @@ services:
     image: ${NAV_IMAGE}
     container_name: mufvps-nav
     env_file: ./env/nav.env
+    ports:
+      - "${NAV_PORT}:${NAV_PORT}"
     depends_on:
       mysql:
         condition: service_healthy
@@ -462,6 +464,8 @@ services:
     image: ${ADMIN_IMAGE}
     container_name: mufvps-nav-admin
     env_file: ./env/admin.env
+    ports:
+      - "${ADMIN_PORT}:${ADMIN_PORT}"
     depends_on:
       mysql:
         condition: service_healthy
