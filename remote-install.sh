@@ -102,6 +102,40 @@ parse_args() {
       --admin-port=*)
         ADMIN_PORT="${1#*=}"
         ;;
+      --enable-https)
+        TLS_MODE="manual"
+        ;;
+      --disable-https)
+        TLS_MODE="http"
+        ;;
+      --ssl-cert)
+        SSL_CERT_SOURCE="$2"
+        shift
+        ;;
+      --ssl-cert=*)
+        SSL_CERT_SOURCE="${1#*=}"
+        ;;
+      --ssl-key)
+        SSL_KEY_SOURCE="$2"
+        shift
+        ;;
+      --ssl-key=*)
+        SSL_KEY_SOURCE="${1#*=}"
+        ;;
+      --auto-cert-email)
+        AUTO_CERT_EMAIL="$2"
+        shift
+        ;;
+      --auto-cert-email=*)
+        AUTO_CERT_EMAIL="${1#*=}"
+        ;;
+      --tls-mode)
+        TLS_MODE="$2"
+        shift
+        ;;
+      --tls-mode=*)
+        TLS_MODE="${1#*=}"
+        ;;
       --non-interactive)
         NON_INTERACTIVE=1
         ;;
@@ -154,6 +188,12 @@ show_help() {
   --admin-domain <域名>              默认 admin.example.com
   --nav-port <端口>                  默认 3000
   --admin-port <端口>                默认 3001
+  --enable-https                     同 --tls-mode manual
+  --disable-https                    同 --tls-mode http
+  --tls-mode <http|manual|auto>      选择 Nginx 暴露模式，默认 http
+  --auto-cert-email <邮箱>           auto 模式下申请证书使用的邮箱
+  --ssl-cert <路径>                  Nginx 使用的证书文件 (PEM)
+  --ssl-key <路径>                   Nginx 使用的私钥文件 (PEM)
   --admin-username <账号>           首次部署管理员用户名，必填
   --admin-email <邮箱>              首次部署管理员邮箱，必填
   --admin-password <密码>           首次部署管理员密码，必填
@@ -271,6 +311,54 @@ prompt_secret_if_missing() {
     printf -v "$var_name" '%s' "$first"
     break
   done
+}
+
+prompt_tls_mode_if_missing() {
+  if [[ -n "${TLS_MODE:-}" ]]; then
+    case "$TLS_MODE" in
+      http|manual|auto) return ;;
+      *) die "无效的 TLS 模式: $TLS_MODE (可选 http/manual/auto)" ;;
+    esac
+  fi
+
+  if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+    TLS_MODE="http"
+    return
+  fi
+
+  echo "请选择 Nginx 暴露模式："
+  echo "  1) 仅 HTTP (默认)"
+  echo "  2) HTTPS（自备证书）"
+  echo "  3) HTTPS（自动申请 Let's Encrypt）"
+
+  while true; do
+    read -rp "请输入选项数字 [1]: " input
+    input="${input:-1}"
+    case "$input" in
+      1)
+        TLS_MODE="http"
+        return
+        ;;
+      2)
+        TLS_MODE="manual"
+        return
+        ;;
+      3)
+        TLS_MODE="auto"
+        return
+        ;;
+      *)
+        echo "无效选项，请输入 1、2 或 3。"
+        ;;
+    esac
+  done
+}
+
+ensure_file_exists() {
+  local path="$1"
+  if [[ ! -f "$path" ]]; then
+    die "找不到文件: $path"
+  fi
 }
 
 generate_bcrypt_hash() {
@@ -546,10 +634,70 @@ EOF
 }
 
 prepare_dirs() {
-  mkdir -p "$PROJECT_ROOT"/{deploy/env,deploy/logs/nginx,deploy/nginx/conf.d,deploy/mysql/data,doc}
+  mkdir -p "$PROJECT_ROOT"/{deploy/env,deploy/logs/nginx,deploy/nginx/conf.d,deploy/nginx/certs,deploy/mysql/data,doc}
+}
+
+copy_tls_artifacts() {
+  if [[ "$TLS_MODE" != "manual" ]]; then
+    return
+  fi
+
+  ensure_file_exists "$SSL_CERT_SOURCE"
+  ensure_file_exists "$SSL_KEY_SOURCE"
+
+  local cert_dest="$PROJECT_ROOT/deploy/nginx/certs/server.crt"
+  local key_dest="$PROJECT_ROOT/deploy/nginx/certs/server.key"
+
+  install -m 644 "$SSL_CERT_SOURCE" "$cert_dest"
+  install -m 600 "$SSL_KEY_SOURCE" "$key_dest"
+}
+
+obtain_cert_auto() {
+  if [[ "$TLS_MODE" != "auto" ]]; then
+    return
+  fi
+
+  local cert_dir="$PROJECT_ROOT/deploy/nginx/certs"
+  local letsencrypt_dir="$cert_dir/letsencrypt"
+  mkdir -p "$letsencrypt_dir"
+
+  if [[ -z "${AUTO_CERT_EMAIL:-}" ]]; then
+    die "自动申请证书模式需要指定 auto-cert-email 参数或在交互中输入邮箱"
+  fi
+
+  if [[ "$AUTO_CERT_EMAIL" != *@*.* ]]; then
+    die "auto-cert-email 格式不正确: $AUTO_CERT_EMAIL"
+  fi
+
+  log "使用 certbot 自动申请证书（nav: ${NAV_DOMAIN}, admin: ${ADMIN_DOMAIN}）..."
+  docker pull certbot/certbot >/dev/null
+  docker run --rm \
+    -p 80:80 -p 443:443 \
+    -v "${letsencrypt_dir}:/etc/letsencrypt" \
+    certbot/certbot certonly --standalone \
+    --agree-tos --no-eff-email --email "${AUTO_CERT_EMAIL}" \
+    -d "${NAV_DOMAIN}" -d "${ADMIN_DOMAIN}"
+
+  local live_dir="${letsencrypt_dir}/live/${NAV_DOMAIN}"
+  if [[ ! -f "${live_dir}/fullchain.pem" || ! -f "${live_dir}/privkey.pem" ]]; then
+    die "证书申请失败，未找到 fullchain.pem/privkey.pem"
+  fi
+
+  install -m 644 "${live_dir}/fullchain.pem" "${cert_dir}/server.crt"
+  install -m 600 "${live_dir}/privkey.pem" "${cert_dir}/server.key"
+  log "证书已保存至 ${cert_dir}/server.crt / server.key"
 }
 
 render_files() {
+  local nav_app_url admin_app_url
+  if [[ "$TLS_MODE" == "http" ]]; then
+    nav_app_url="http://${NAV_DOMAIN}"
+    admin_app_url="http://${ADMIN_DOMAIN}"
+  else
+    nav_app_url="https://${NAV_DOMAIN}"
+    admin_app_url="https://${ADMIN_DOMAIN}"
+  fi
+
   local compose_path="$PROJECT_ROOT/deploy/docker-compose.yml"
   cat >"$compose_path" <<EOF
 services:
@@ -602,6 +750,7 @@ services:
       - admin
     volumes:
       - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/certs:/etc/nginx/certs:ro
       - ./logs/nginx:/var/log/nginx
     ports:
       - "80:80"
@@ -626,7 +775,7 @@ NODE_ENV=production
 PORT=${NAV_PORT}
 DATABASE_URL=mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE}
 DATABASE_POOL_SIZE=20
-NEXT_PUBLIC_APP_URL=https://${NAV_DOMAIN}
+NEXT_PUBLIC_APP_URL=${nav_app_url}
 SESSION_SECRET=${NAV_SESSION_SECRET}
 EOF
 
@@ -634,11 +783,69 @@ EOF
 NODE_ENV=production
 PORT=${ADMIN_PORT}
 DATABASE_URL=mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE}
-NEXT_PUBLIC_APP_URL=https://${ADMIN_DOMAIN}
+NEXT_PUBLIC_APP_URL=${admin_app_url}
 SESSION_SECRET=${ADMIN_SESSION_SECRET}
 EOF
 
-  cat >"$PROJECT_ROOT/deploy/nginx/conf.d/mufvps.conf" <<EOF
+  if [[ "$TLS_MODE" != "http" ]]; then
+    cat >"$PROJECT_ROOT/deploy/nginx/conf.d/mufvps.conf" <<'EOF'
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+EOF
+
+    cat >>"$PROJECT_ROOT/deploy/nginx/conf.d/mufvps.conf" <<EOF
+server {
+    listen 80;
+    server_name ${NAV_DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name ${NAV_DOMAIN};
+    ssl_certificate /etc/nginx/certs/server.crt;
+    ssl_certificate_key /etc/nginx/certs/server.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    location / {
+        proxy_pass http://nav:${NAV_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+    }
+}
+
+server {
+    listen 80;
+    server_name ${ADMIN_DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name ${ADMIN_DOMAIN};
+    ssl_certificate /etc/nginx/certs/server.crt;
+    ssl_certificate_key /etc/nginx/certs/server.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    location / {
+        proxy_pass http://admin:${ADMIN_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+    }
+}
+EOF
+  else
+    cat >"$PROJECT_ROOT/deploy/nginx/conf.d/mufvps.conf" <<EOF
 server {
     listen 80;
     server_name ${NAV_DOMAIN};
@@ -661,6 +868,7 @@ server {
     }
 }
 EOF
+  fi
 
   cat >"$PROJECT_ROOT/deploy/deploy.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -708,6 +916,10 @@ NAV_DOMAIN=${NAV_DOMAIN:-nav.example.com}
 ADMIN_DOMAIN=${ADMIN_DOMAIN:-admin.example.com}
 NAV_PORT=${NAV_PORT:-3000}
 ADMIN_PORT=${ADMIN_PORT:-3001}
+TLS_MODE=${TLS_MODE:-}
+SSL_CERT_SOURCE=${SSL_CERT_SOURCE:-}
+SSL_KEY_SOURCE=${SSL_KEY_SOURCE:-}
+AUTO_CERT_EMAIL=${AUTO_CERT_EMAIL:-}
 NON_INTERACTIVE=${NON_INTERACTIVE:-0}
 ADMIN_USERNAME=${ADMIN_USERNAME:-}
 ADMIN_EMAIL=${ADMIN_EMAIL:-}
@@ -723,6 +935,16 @@ prompt_if_missing "MYSQL_PASSWORD" "请输入 MySQL 用户密码 (建议复杂)"
 prompt_if_missing "ADMIN_USERNAME" "请输入后台管理员用户名"
 prompt_if_missing "ADMIN_EMAIL" "请输入后台管理员邮箱"
 prompt_secret_if_missing "ADMIN_PASSWORD" "请输入后台管理员密码"
+prompt_tls_mode_if_missing
+
+if [[ "$TLS_MODE" == "manual" ]]; then
+  prompt_if_missing "SSL_CERT_SOURCE" "请输入 TLS 证书文件路径 (例如 /root/fullchain.pem)"
+  prompt_if_missing "SSL_KEY_SOURCE" "请输入 TLS 私钥文件路径 (例如 /root/privkey.pem)"
+  ensure_file_exists "$SSL_CERT_SOURCE"
+  ensure_file_exists "$SSL_KEY_SOURCE"
+elif [[ "$TLS_MODE" == "auto" ]]; then
+  prompt_if_missing "AUTO_CERT_EMAIL" "请输入用于申请证书的邮箱"
+fi
 
 if [[ "$ADMIN_EMAIL" != *@*.* ]]; then
   die "管理员邮箱格式不正确，请重新输入。"
@@ -739,6 +961,8 @@ ensure_compose_plugin
 
 log "准备部署目录 ${PROJECT_ROOT}..."
 prepare_dirs
+copy_tls_artifacts
+obtain_cert_auto
 render_files
 
 log "MySQL 初始化脚本写入完成"
@@ -760,6 +984,11 @@ cat <<EOF
 - 数据库脚本: ${PROJECT_ROOT}/doc/mufvps_nav.sql
 - 首次管理员用户名: ${ADMIN_USERNAME}
 - 首次管理员邮箱: ${ADMIN_EMAIL}
+- HTTPS 模式: $(case "$TLS_MODE" in
+    http) echo "仅 HTTP" ;;
+    manual) echo "HTTPS（自备证书，路径 deploy/nginx/certs）" ;;
+    auto) echo "HTTPS（自动申请证书，已保存至 deploy/nginx/certs）" ;;
+  esac)
 
 如需后续更新，可执行:
   cd ${PROJECT_ROOT}/deploy && docker compose pull && docker compose up -d
