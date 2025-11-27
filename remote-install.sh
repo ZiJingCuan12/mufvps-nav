@@ -105,6 +105,27 @@ parse_args() {
       --non-interactive)
         NON_INTERACTIVE=1
         ;;
+      --admin-username)
+        ADMIN_USERNAME="$2"
+        shift
+        ;;
+      --admin-username=*)
+        ADMIN_USERNAME="${1#*=}"
+        ;;
+      --admin-email)
+        ADMIN_EMAIL="$2"
+        shift
+        ;;
+      --admin-email=*)
+        ADMIN_EMAIL="${1#*=}"
+        ;;
+      --admin-password)
+        ADMIN_PASSWORD="$2"
+        shift
+        ;;
+      --admin-password=*)
+        ADMIN_PASSWORD="${1#*=}"
+        ;;
       -h|--help)
         show_help
         exit 0
@@ -133,6 +154,9 @@ show_help() {
   --admin-domain <域名>              默认 admin.example.com
   --nav-port <端口>                  默认 3000
   --admin-port <端口>                默认 3001
+  --admin-username <账号>           首次部署管理员用户名，必填
+  --admin-email <邮箱>              首次部署管理员邮箱，必填
+  --admin-password <密码>           首次部署管理员密码，必填
   --non-interactive                  非交互模式，缺失参数会直接报错
 EOF
 }
@@ -214,6 +238,91 @@ prompt_if_missing() {
     fi
     echo "该项不能为空，请重新输入。"
   done
+}
+
+prompt_secret_if_missing() {
+  local var_name="$1"
+  local hint="$2"
+  local current="${!var_name-}"
+  local first=""
+  local second=""
+
+  if [[ -n "$current" ]]; then
+    return
+  fi
+
+  if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+    die "缺少必填参数: $var_name"
+  fi
+
+  while true; do
+    read -rsp "$hint: " first
+    echo
+    if [[ -z "$first" ]]; then
+      echo "该项不能为空，请重新输入。"
+      continue
+    fi
+    read -rsp "请再次输入确认: " second
+    echo
+    if [[ "$first" != "$second" ]]; then
+      echo "两次输入不一致，请重新输入。"
+      continue
+    fi
+    printf -v "$var_name" '%s' "$first"
+    break
+  done
+}
+
+generate_bcrypt_hash() {
+  local plaintext="$1"
+  local hash=""
+
+  if command -v python3 >/dev/null 2>&1; then
+    hash=$(
+      ADMIN_PASSWORD_INPUT="$plaintext" python3 - <<'PY' 2>/dev/null
+import os
+import sys
+
+password = os.environ.get("ADMIN_PASSWORD_INPUT")
+if not password:
+    sys.exit(1)
+
+try:
+    import bcrypt
+except ImportError:
+    sys.exit(1)
+
+print(bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode())
+PY
+    ) || hash=""
+
+    if [[ -n "$hash" ]]; then
+      echo "$hash"
+      return
+    fi
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    hash=$(printf '%s' "$plaintext" | openssl passwd -bcrypt -stdin 2>/dev/null || true)
+    if [[ "$hash" == \$2* ]]; then
+      echo "$hash"
+      return
+    fi
+  fi
+
+  if command -v docker >/dev/null 2>&1; then
+    hash=$(
+      docker run --rm node:20-alpine \
+        node -e "const bcrypt=require('bcryptjs');console.log(bcrypt.hashSync(process.argv[1],10));" \
+        "$plaintext" 2>/dev/null || true
+    )
+    if [[ -n "$hash" ]]; then
+      echo "$hash"
+      return
+    fi
+  fi
+
+  die "无法生成管理员密码哈希，请确保系统安装 python3/bcrypt、openssl 或可用 docker。"
 }
 
 generate_secret() {
@@ -420,6 +529,20 @@ CREATE TABLE `users`  (
 
 SET FOREIGN_KEY_CHECKS = 1;
 EOF
+
+  cat >>"$path" <<EOF
+
+-- ----------------------------
+-- Default administrator bootstrap
+-- ----------------------------
+INSERT INTO \`users\` (\`username\`, \`email\`, \`password_hash\`, \`role\`)
+VALUES ('${ADMIN_USERNAME}', '${ADMIN_EMAIL}', '${ADMIN_PASSWORD_HASH}', 'admin');
+
+SET @default_admin_user_id := LAST_INSERT_ID();
+
+INSERT INTO \`admin_users\` (\`user_id\`, \`created_at\`)
+VALUES (@default_admin_user_id, CURRENT_TIMESTAMP);
+EOF
 }
 
 prepare_dirs() {
@@ -586,6 +709,10 @@ ADMIN_DOMAIN=${ADMIN_DOMAIN:-admin.example.com}
 NAV_PORT=${NAV_PORT:-3000}
 ADMIN_PORT=${ADMIN_PORT:-3001}
 NON_INTERACTIVE=${NON_INTERACTIVE:-0}
+ADMIN_USERNAME=${ADMIN_USERNAME:-}
+ADMIN_EMAIL=${ADMIN_EMAIL:-}
+ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH:-}
 
 parse_args "$@"
 
@@ -593,6 +720,16 @@ prompt_if_missing "NAV_IMAGE" "请输入 nav 镜像 (例如 registry.example.com
 prompt_if_missing "ADMIN_IMAGE" "请输入 admin 镜像 (例如 registry.example.com/mufvps-nav-admin:latest)"
 prompt_if_missing "MYSQL_ROOT_PASSWORD" "请输入 MySQL Root 密码 (建议复杂)"
 prompt_if_missing "MYSQL_PASSWORD" "请输入 MySQL 用户密码 (建议复杂)"
+prompt_if_missing "ADMIN_USERNAME" "请输入后台管理员用户名"
+prompt_if_missing "ADMIN_EMAIL" "请输入后台管理员邮箱"
+prompt_secret_if_missing "ADMIN_PASSWORD" "请输入后台管理员密码"
+
+if [[ "$ADMIN_EMAIL" != *@*.* ]]; then
+  die "管理员邮箱格式不正确，请重新输入。"
+fi
+
+ADMIN_PASSWORD_HASH=$(generate_bcrypt_hash "$ADMIN_PASSWORD")
+unset ADMIN_PASSWORD
 
 NAV_SESSION_SECRET=${NAV_SESSION_SECRET:-$(generate_secret)}
 ADMIN_SESSION_SECRET=${ADMIN_SESSION_SECRET:-$(generate_secret)}
@@ -621,9 +758,13 @@ cat <<EOF
 - docker compose 文件: ${PROJECT_ROOT}/deploy/docker-compose.yml
 - Nginx 配置: ${PROJECT_ROOT}/deploy/nginx/conf.d/mufvps.conf
 - 数据库脚本: ${PROJECT_ROOT}/doc/mufvps_nav.sql
+- 首次管理员用户名: ${ADMIN_USERNAME}
+- 首次管理员邮箱: ${ADMIN_EMAIL}
 
 如需后续更新，可执行:
   cd ${PROJECT_ROOT}/deploy && docker compose pull && docker compose up -d
+
+提示：管理员账号已写入数据库初始化脚本，请使用以上账号密码登录后台并尽快修改密码。
 ====================================================
 EOF
 
