@@ -912,8 +912,8 @@ MYSQL_DATABASE=${MYSQL_DATABASE:-mufvps_nav}
 MYSQL_USER=${MYSQL_USER:-mufvps_user}
 MYSQL_PASSWORD=${MYSQL_PASSWORD:-}
 MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-}
-NAV_DOMAIN=${NAV_DOMAIN:-nav.example.com}
-ADMIN_DOMAIN=${ADMIN_DOMAIN:-admin.example.com}
+NAV_DOMAIN=${NAV_DOMAIN:-}
+ADMIN_DOMAIN=${ADMIN_DOMAIN:-}
 NAV_PORT=${NAV_PORT:-3000}
 ADMIN_PORT=${ADMIN_PORT:-3001}
 TLS_MODE=${TLS_MODE:-}
@@ -935,6 +935,8 @@ prompt_if_missing "MYSQL_PASSWORD" "请输入 MySQL 用户密码 (建议复杂)"
 prompt_if_missing "ADMIN_USERNAME" "请输入后台管理员用户名"
 prompt_if_missing "ADMIN_EMAIL" "请输入后台管理员邮箱"
 prompt_secret_if_missing "ADMIN_PASSWORD" "请输入后台管理员密码"
+prompt_if_missing "NAV_DOMAIN" "请输入前台访问域名 (例如 nav.example.com)" "nav.example.com"
+prompt_if_missing "ADMIN_DOMAIN" "请输入后台访问域名 (例如 admin.example.com)" "admin.example.com"
 prompt_tls_mode_if_missing
 
 if [[ "$TLS_MODE" == "manual" ]]; then
